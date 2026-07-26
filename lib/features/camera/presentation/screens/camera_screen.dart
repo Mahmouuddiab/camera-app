@@ -32,11 +32,14 @@ class _CameraScreenState extends ConsumerState<CameraScreen>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState appState) {
-    final controller = ref.read(cameraNotifierProvider).controller;
-    if (controller == null || !controller.value.isInitialized) return;
+    final state = ref.read(cameraNotifierProvider);
+    final controller = state.controller;
 
-    if (appState == AppLifecycleState.inactive) {
-      controller.dispose();
+    if (appState == AppLifecycleState.inactive ||
+        appState == AppLifecycleState.paused) {
+      if (controller != null && controller.value.isInitialized) {
+        controller.dispose();
+      }
     } else if (appState == AppLifecycleState.resumed) {
       ref.read(cameraNotifierProvider.notifier).setup();
     }
@@ -46,14 +49,6 @@ class _CameraScreenState extends ConsumerState<CameraScreen>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
-  }
-
-  void _onTapToFocus(TapUpDetails details, BoxConstraints constraints) {
-    final normalized = Offset(
-      details.localPosition.dx / constraints.maxWidth,
-      details.localPosition.dy / constraints.maxHeight,
-    );
-    ref.read(cameraNotifierProvider.notifier).onTapToFocus(normalized);
   }
 
   @override
@@ -79,7 +74,6 @@ class _CameraScreenState extends ConsumerState<CameraScreen>
           CameraLifecycleStatus.ready => _ReadyView(
             state: state,
             notifier: notifier,
-            onTapToFocus: _onTapToFocus,
           ),
         },
       ),
@@ -87,39 +81,70 @@ class _CameraScreenState extends ConsumerState<CameraScreen>
   }
 }
 
-class _ReadyView extends StatelessWidget {
+class _ReadyView extends StatefulWidget {
   final CameraState state;
   final CameraNotifier notifier;
-  final void Function(TapUpDetails, BoxConstraints) onTapToFocus;
 
   const _ReadyView({
     required this.state,
     required this.notifier,
-    required this.onTapToFocus,
   });
 
   @override
+  State<_ReadyView> createState() => _ReadyViewState();
+}
+
+class _ReadyViewState extends State<_ReadyView> {
+  Offset? _focusPoint;
+
+  void _handleTapToFocus(TapUpDetails details, BoxConstraints constraints) {
+    final point = details.localPosition;
+    setState(() {
+      _focusPoint = point;
+    });
+
+    final normalized = Offset(
+      point.dx / constraints.maxWidth,
+      point.dy / constraints.maxHeight,
+    );
+    widget.notifier.onTapToFocus(normalized);
+
+    // Hide focus ring after 1.5 seconds
+    Future.delayed(const Duration(milliseconds: 1500), () {
+      if (mounted) {
+        setState(() {
+          _focusPoint = null;
+        });
+      }
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final controller = state.controller;
+    final controller = widget.state.controller;
     if (controller == null || !controller.value.isInitialized) {
       return const SizedBox.shrink();
     }
 
+    final isFrontCamera =
+        widget.state.cameras[widget.state.cameraIndex].lensDirection ==
+            CameraLensDirection.front;
+
     return Column(
       children: [
         TopControlsBar(
-          flashMode: state.flashMode,
-          onFlashTap: notifier.cycleFlash,
+          flashMode: widget.state.flashMode,
+          onFlashTap: isFrontCamera ? () {} : widget.notifier.cycleFlash,
           onGalleryTap: () {},
         ),
         Expanded(
           child: LayoutBuilder(
             builder: (context, constraints) {
               return GestureDetector(
-                onScaleStart: (_) => notifier.onScaleStart(),
-                onScaleUpdate:
-                    (details) => notifier.onScaleUpdate(details.scale),
-                onTapUp: (details) => onTapToFocus(details, constraints),
+                onScaleStart: (_) => widget.notifier.onScaleStart(),
+                onScaleUpdate: (details) =>
+                    widget.notifier.onScaleUpdate(details.scale),
+                onTapUp: (details) => _handleTapToFocus(details, constraints),
                 child: Stack(
                   fit: StackFit.expand,
                   children: [
@@ -135,7 +160,7 @@ class _ReadyView extends StatelessWidget {
                             height: controller.value.previewSize?.width ?? 0,
                             child: ColorFiltered(
                               colorFilter: ColorFilter.matrix(
-                                state.filter.matrix,
+                                widget.state.filter.matrix,
                               ),
                               child: CameraPreview(controller),
                             ),
@@ -143,13 +168,32 @@ class _ReadyView extends StatelessWidget {
                         ),
                       ),
                     ),
-                    if (state.isRecording)
+                    // Tap to Focus Ring Overlay
+                    if (_focusPoint != null)
+                      Positioned(
+                        left: _focusPoint!.dx - 25,
+                        top: _focusPoint!.dy - 25,
+                        child: Container(
+                          width: 50,
+                          height: 50,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: AppColors.accentPink,
+                              width: 2,
+                            ),
+                          ),
+                        ),
+                      ),
+                    if (widget.state.isRecording)
                       Positioned(
                         top: 16,
                         left: 0,
                         right: 0,
                         child: Center(
-                          child: RecordingTimerWidget(elapsed: state.elapsed),
+                          child: RecordingTimerWidget(
+                            elapsed: widget.state.elapsed,
+                          ),
                         ),
                       ),
                     Positioned(
@@ -158,12 +202,11 @@ class _ReadyView extends StatelessWidget {
                       right: 0,
                       child: Row(
                         mainAxisAlignment: MainAxisAlignment.center,
-                        children:
-                        [1.0, 2.0, 3.0].map((zoom) {
+                        children: [1.0, 2.0, 3.0].map((zoom) {
                           final isSelected =
-                              (state.zoomLevel - zoom).abs() < 0.2;
+                              (widget.state.zoomLevel - zoom).abs() < 0.2;
                           return GestureDetector(
-                            onTap: () => notifier.setZoomDirect(zoom),
+                            onTap: () => widget.notifier.setZoomDirect(zoom),
                             child: AnimatedContainer(
                               duration: const Duration(milliseconds: 200),
                               margin: const EdgeInsets.symmetric(
@@ -171,13 +214,11 @@ class _ReadyView extends StatelessWidget {
                               ),
                               padding: const EdgeInsets.all(10),
                               decoration: BoxDecoration(
-                                color:
-                                isSelected
-                                    ? Colors.black.withOpacity(0.6)
-                                    : Colors.black.withOpacity(0.3),
+                                color: isSelected
+                                    ? Colors.black.withValues(alpha: 0.6)
+                                    : Colors.black.withValues(alpha: 0.3),
                                 shape: BoxShape.circle,
-                                border:
-                                isSelected
+                                border: isSelected
                                     ? Border.all(
                                   color: AppColors.accentPink,
                                   width: 2,
@@ -187,8 +228,7 @@ class _ReadyView extends StatelessWidget {
                               child: Text(
                                 AppStrings.zoomLabel(zoom.toInt()),
                                 style: TextStyle(
-                                  color:
-                                  isSelected
+                                  color: isSelected
                                       ? Colors.white
                                       : Colors.white70,
                                   fontSize: 12,
@@ -200,13 +240,13 @@ class _ReadyView extends StatelessWidget {
                         }).toList(),
                       ),
                     ),
-                    if (state.showZoomIndicator)
+                    if (widget.state.showZoomIndicator)
                       Positioned(
                         bottom: 70,
                         left: 0,
                         right: 0,
                         child: Center(
-                          child: ZoomIndicator(zoom: state.zoomLevel),
+                          child: ZoomIndicator(zoom: widget.state.zoomLevel),
                         ),
                       ),
                   ],
@@ -220,32 +260,34 @@ class _ReadyView extends StatelessWidget {
           child: Column(
             children: [
               FilterSelector(
-                selected: state.filter,
-                onSelected: notifier.selectFilter,
+                selected: widget.state.filter,
+                onSelected: widget.notifier.selectFilter,
               ),
               const SizedBox(height: 12),
-              if (!state.isRecording)
+              if (!widget.state.isRecording)
                 Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     _ModeButton(
                       label: AppStrings.photoMode,
-                      isSelected: state.captureMode == CaptureMode.photo,
-                      onTap: () => notifier.setCaptureMode(CaptureMode.photo),
+                      isSelected: widget.state.captureMode == CaptureMode.photo,
+                      onTap: () =>
+                          widget.notifier.setCaptureMode(CaptureMode.photo),
                     ),
                     const SizedBox(width: 24),
                     _ModeButton(
                       label: AppStrings.videoMode,
-                      isSelected: state.captureMode == CaptureMode.video,
-                      onTap: () => notifier.setCaptureMode(CaptureMode.video),
+                      isSelected: widget.state.captureMode == CaptureMode.video,
+                      onTap: () =>
+                          widget.notifier.setCaptureMode(CaptureMode.video),
                     ),
                   ],
                 ),
               const SizedBox(height: 16),
               BottomControlsBar(
-                isRecording: state.isRecording,
-                onRecordTap: () => notifier.onCaptureTap(context),
-                onSwitchCameraTap: notifier.switchCamera,
+                isRecording: widget.state.isRecording,
+                onRecordTap: () => widget.notifier.onCaptureTap(context),
+                onSwitchCameraTap: widget.notifier.switchCamera,
               ),
             ],
           ),

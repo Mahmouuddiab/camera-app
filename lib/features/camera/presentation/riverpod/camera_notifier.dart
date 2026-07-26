@@ -97,11 +97,34 @@ class CameraNotifier extends StateNotifier<CameraState> {
       maxZoom: maxZoom,
       flashMode: FlashMode.off,
     );
+
+    final isFront = cameras[index].lensDirection == CameraLensDirection.front;
+    if (!isFront) {
+      await Future.delayed(const Duration(milliseconds: 100));
+      try {
+        await setFlashModeUseCase(controller, FlashMode.off);
+      } catch (e) {
+        debugPrint('Failed setting initial flash mode: $e');
+      }
+    }
   }
 
-  void setCaptureMode(CaptureMode mode) {
-    if (state.isRecording || state.isTakingPhoto) return;
-    state = state.copyWith(captureMode: mode);
+  Future<void> setCaptureMode(CaptureMode mode) async {
+    if (state.isRecording || state.isTakingPhoto || mode == state.captureMode) return;
+
+    final controller = state.controller;
+    if (controller != null && controller.value.isInitialized) {
+      try {
+        await setFlashModeUseCase(controller, FlashMode.off);
+      } catch (e) {
+        debugPrint('Error resetting flash mode: $e');
+      }
+    }
+
+    state = state.copyWith(
+      captureMode: mode,
+      flashMode: FlashMode.off,
+    );
   }
 
   Future<void> switchCamera() async {
@@ -114,13 +137,25 @@ class CameraNotifier extends StateNotifier<CameraState> {
 
   Future<void> cycleFlash() async {
     final controller = state.controller;
-    if (controller == null || state.isFrontCamera) return;
+    if (controller == null || !controller.value.isInitialized) return;
 
-    const cycle = [FlashMode.off, FlashMode.auto, FlashMode.always];
-    final nextMode = cycle[(cycle.indexOf(state.flashMode) + 1) % cycle.length];
+    final currentCamera = state.cameras[state.cameraIndex];
+    if (currentCamera.lensDirection == CameraLensDirection.front) return;
 
-    await setFlashModeUseCase(controller, nextMode);
-    state = state.copyWith(flashMode: nextMode);
+    final List<FlashMode> availableModes = state.captureMode == CaptureMode.video
+        ? [FlashMode.off, FlashMode.torch]
+        : [FlashMode.off, FlashMode.always, FlashMode.auto, FlashMode.torch];
+
+    final currentIndex = availableModes.indexOf(state.flashMode);
+    final validIndex = currentIndex == -1 ? 0 : currentIndex;
+    final nextMode = availableModes[(validIndex + 1) % availableModes.length];
+
+    try {
+      await setFlashModeUseCase(controller, nextMode);
+      state = state.copyWith(flashMode: nextMode);
+    } catch (e) {
+      debugPrint('Failed to set flash mode: $e');
+    }
   }
 
   void onScaleStart() {
@@ -187,7 +222,27 @@ class CameraNotifier extends StateNotifier<CameraState> {
 
     try {
       state = state.copyWith(isTakingPhoto: true);
+
+      final currentCamera = state.cameras[state.cameraIndex];
+      final isBackCamera = currentCamera.lensDirection != CameraLensDirection.front;
+
+      // Force flash state synchronization with native driver before taking image
+      if (isBackCamera && state.flashMode != FlashMode.off) {
+        if (state.flashMode == FlashMode.always || state.flashMode == FlashMode.auto) {
+          // Hardware workaround: Use torch pre-burst to force physical illumination
+          await setFlashModeUseCase(controller, FlashMode.torch);
+          await Future.delayed(const Duration(milliseconds: 200));
+        } else {
+          await setFlashModeUseCase(controller, state.flashMode);
+        }
+      }
+
       final photoFile = await cameraRepository.takePicture(controller);
+
+      // Restore flash mode to user-selected setting after capture
+      if (isBackCamera && (state.flashMode == FlashMode.always || state.flashMode == FlashMode.auto)) {
+        await setFlashModeUseCase(controller, state.flashMode);
+      }
 
       final savedPath = await savePhotoUseCase(
         imagePath: photoFile.path,
@@ -225,6 +280,15 @@ class CameraNotifier extends StateNotifier<CameraState> {
     if (controller == null || !controller.value.isInitialized) return;
 
     await startRecordingUseCase(controller);
+
+    if (state.flashMode == FlashMode.torch) {
+      try {
+        await setFlashModeUseCase(controller, FlashMode.torch);
+      } catch (e) {
+        debugPrint('Failed to maintain torch on record start: $e');
+      }
+    }
+
     await WakelockPlus.enable();
 
     state = state.copyWith(isRecording: true, elapsed: Duration.zero);
